@@ -1,0 +1,6 @@
+*.vcd
+*.out
+*.vvp
+sim.out
+.DS_Store
+Thumbs.db
