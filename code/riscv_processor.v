@@ -1,153 +1,250 @@
-module mips32_processor(clk1,clk2);
-input clk1,clk2;
+module riscv_processor(clk,reset);
+input clk,reset;
 
 reg [31:0] register_bank[0:31]; // register file
-reg [31:0] mem [0:1023];  // memory
 
 reg [31:0] PC,IF_ID_IR,IF_ID_NPC;
 reg [31:0] ID_EX_A,ID_EX_B,ID_EX_IR,ID_EX_NPC,ID_EX_Imm;
+reg [2:0] ID_EX_funct3;
+reg [7:0] ID_EX_funct7; // 
 reg [31:0] EX_MEM_ALUOut,EX_MEM_B,EX_MEM_IR;
 reg EX_MEM_cond;
 reg [31:0] MEM_WB_LMD,MEM_WB_ALUOut,MEM_WB_IR;
 reg [2:0] ID_EX_type,EX_MEM_type,MEM_WB_type;
 
-//Assumed opcode of instructions
-parameter ADD=6'b000000, SUB=6'b000001, AND=6'b000010, OR=6'b000011,
-          SLT=6'b000100, MUL=6'b000101, HLT=6'b111111, LW=6'b000110,
-          SW=6'b001001, ADDI=6'b001010, SUBI=6'b001011, SLTI=6'b001100,
-          BNEQZ=6'b001101, BEQZ=6'b001110;
+parameter
+    OP_RTYPE  = 7'b0110011,  // ADD,SUB,AND,OR,SLT,MUL
+    OP_ITYPE  = 7'b0010011,  // ADDI,SLTI,ANDI,ORI
+    OP_LOAD   = 7'b0000011,  // LW
+    OP_STORE  = 7'b0100011,  // SW
+    OP_BRANCH = 7'b1100011,  // BEQ,BNE
+    OP_HALT   = 7'b1111111;  // custom halt
+
+// funct3 parameters:
+parameter
+    F3_ADD_SUB = 3'b000,
+    F3_MUL     = 3'b000,
+    F3_AND     = 3'b111,
+    F3_OR      = 3'b110,
+    F3_SLT     = 3'b010,
+    F3_BEQ     = 3'b000,
+    F3_BNE     = 3'b001,
+    F3_LW_SW   = 3'b010;
+//funct7 parameters:
+parameter
+    F7_ADD  = 7'b0000000,
+    F7_SUB  = 7'b0100000,
+    F7_MUL  = 7'b0000001,
+    F7_AND = 7'b0000000,
+    F7_OR  = 7'b0000000,
+    F7_SLT = 7'b0000000;
+// Instruction type parameters
+parameter RR_ALU = 3'b000,
+          RM_ALU = 3'b001,
+          LOAD   = 3'b010,
+          STORE  = 3'b011,
+          BRANCH = 3'b100,
+          HALT   = 3'b101;
 
 reg HALTED,TAKEN_BRANCH;
-parameter RR_ALU=3'b000, RM_ALU=3'b001, LOAD=3'b010, STORE=3'b011, BRANCH=3'b100, HALT=3'b101;  // instruction types
-//IF Stage
-always @(posedge clk1) begin
-        if (!HALTED) begin
-            IF_ID_IR <= mem[PC];  // fetch instruction
-            if (((EX_MEM_IR[31:26]==BNEQZ) & (EX_MEM_cond))|((EX_MEM_IR[31:26]==BEQZ) & (EX_MEM_cond))) begin
-                TAKEN_BRANCH <= #2 1;
-                IF_ID_NPC <= #2 EX_MEM_ALUOut;  // branch target
-                PC <= #2 EX_MEM_ALUOut;  // update PC to branch target
+
+wire [31:0] imem_data;
+wire [31:0] dmem_read_data;
+wire mem_write_en = (EX_MEM_type == STORE) && (!HALTED) && (!TAKEN_BRANCH);
+instruction_memory imem_inst (.pc(PC), .instruction(imem_data));
+data_memory dmem_inst (.clk(clk), .mem_write(mem_write_en), .address(EX_MEM_ALUOut), .write_data(EX_MEM_B), .read_data(dmem_read_data));
+// Initialize register bank to 0
+integer i;
+initial begin 
+    for(i=0; i<32; i=i+1) 
+    register_bank[i] = 0;
+end
+//-------------------------------------------------------IF Stage------------------------------------------------------------------------------
+always @(posedge clk) begin
+    if (reset) begin
+        PC <= 0;
+        IF_ID_IR <= 0;
+        IF_ID_NPC <= 0;
+        TAKEN_BRANCH <= 0;
+        HALTED <= 0;
+    end
+        else if (!HALTED) begin
+            if ((EX_MEM_IR[6:0]==OP_BRANCH) && (EX_MEM_cond)) begin  //branch taken from EX stage
+                TAKEN_BRANCH <=  1;
+                IF_ID_NPC <=  EX_MEM_ALUOut;  // branch target
+                PC <=  EX_MEM_ALUOut;  // update PC to branch target
+                IF_ID_IR <= 0;  // flush the instruction in IF/ID pipeline register
             end
             else begin
+                IF_ID_IR <= imem_data;  // fetch instruction
                 TAKEN_BRANCH <= 0;
-                IF_ID_NPC <= #2 PC + 4;  // next instruction
-                PC <= #2 PC + 4;  // increment PC
+                IF_ID_NPC <=  PC + 4;  // next instruction
+                PC <=  PC + 4;  // increment PC
             end
         end
     end
-//ID Stage
-always @(posedge clk2) begin
-    if (!HALTED) begin
-    ID_EX_IR <= #2 IF_ID_IR;  // decode instruction
-    ID_EX_NPC <= #2 IF_ID_NPC;
-    case (IF_ID_IR[31:26])  // opcode
-        ADD, SUB, AND, OR, SLT, MUL: begin
-            ID_EX_A <= #2 register_bank[IF_ID_IR[25:21]];  // rs
-            ID_EX_B <= #2 register_bank[IF_ID_IR[20:16]];  // rt
-            ID_EX_type <= #2 RR_ALU;
+//--------------------------------------------------------ID Stage------------------------------------------------------------------------------
+always @(posedge clk) begin
+    if (reset) begin
+        ID_EX_IR <= 0;
+        ID_EX_NPC <= 0;
+        ID_EX_A <= 0;
+        ID_EX_B <= 0;
+        ID_EX_Imm <= 0;
+        ID_EX_funct3 <= 0;
+        ID_EX_funct7 <= 0;
+        ID_EX_type <= 3'b000;
+    end
+    else if (!HALTED) begin
+    ID_EX_IR <= IF_ID_IR;  // decode instruction
+    ID_EX_NPC <= IF_ID_NPC;
+    ID_EX_funct3  <= IF_ID_IR[14:12];
+    ID_EX_funct7 <= IF_ID_IR[31:25];
+    case (IF_ID_IR[6:0])  // opcode
+        OP_RTYPE: begin
+            ID_EX_A <= register_bank[IF_ID_IR[19:15]];  // rs1
+            ID_EX_B <= register_bank[IF_ID_IR[24:20]];  // rs2
+            ID_EX_Imm <= 0;  // no immediate for R-type
+            ID_EX_type <=  RR_ALU;
         end
-        ADDI, SUBI, SLTI: begin
-            ID_EX_A <= #2 register_bank[IF_ID_IR[25:21]];  // rs
-            ID_EX_Imm <= #2 {{16{IF_ID_IR[15]}}, IF_ID_IR[15:0]};  // sign-extend immediate
-            ID_EX_type <= #2 RM_ALU;
+        OP_ITYPE: begin
+            ID_EX_A <= register_bank[IF_ID_IR[19:15]];  // rs1
+            ID_EX_Imm  <= {{20{IF_ID_IR[31]}}, IF_ID_IR[31:20]};  // sign-extend immediate
+            ID_EX_B <= 0;  // no second register operand for I-type
+            ID_EX_type <= RM_ALU;
         end
-        LW, SW: begin
-            ID_EX_A <= #2 register_bank[IF_ID_IR[25:21]];  // base register
-            ID_EX_Imm <= #2 {{16{IF_ID_IR[15]}}, IF_ID_IR[15:0]};  // sign-extend offset
-            if (IF_ID_IR[31:26] == LW)
-                ID_EX_type <= #2 LOAD;
-            else
-                ID_EX_type <= #2 STORE;
+        OP_LOAD: begin
+            ID_EX_A <= register_bank[IF_ID_IR[19:15]];  // rs1=base
+            ID_EX_Imm  <= {{20{IF_ID_IR[31]}}, IF_ID_IR[31:20]};  // sign-extend offset
+            ID_EX_B <= 0;  
+            ID_EX_type <= LOAD;
+            
         end
-        BNEQZ, BEQZ: begin
-            ID_EX_A <= #2 register_bank[IF_ID_IR[25:21]];  // rs
-            ID_EX_Imm <= #2 {{16{IF_ID_IR[15]}}, IF_ID_IR[15:0]};  // sign-extend offset
-            ID_EX_type <= #2 BRANCH;
+        OP_STORE: begin
+            ID_EX_A <=  register_bank[IF_ID_IR[19:15]];  // rs1=base
+            ID_EX_B <= register_bank[IF_ID_IR[24:20]];  // rs2 (value to store)
+            ID_EX_Imm  <= {{20{IF_ID_IR[31]}}, IF_ID_IR[31:25], IF_ID_IR[11:7]};  // sign-extend offset
+            ID_EX_type <= STORE;
         end
-        HLT: begin
+        OP_BRANCH: begin
+            ID_EX_A <= register_bank[IF_ID_IR[19:15]];  // rs1
+            ID_EX_B    <= register_bank[IF_ID_IR[24:20]]; // rs2
+            ID_EX_Imm  <= {{19{IF_ID_IR[31]}},
+                               IF_ID_IR[31], IF_ID_IR[7],
+                               IF_ID_IR[30:25], IF_ID_IR[11:8],
+                               1'b0};
+            
+            ID_EX_type <= BRANCH;
+        end
+        OP_HALT: begin
             HALTED <= 1;
-            ID_EX_type <= #2 HALT;
+            ID_EX_type <= HALT;
         end
-        default: ID_EX_type <= #2 HALT;  // treat unknown instructions as halt
+        default: ID_EX_type <= HALT;  // treat unknown instructions as halt
     endcase
     end
 end
-//EX Stage
-always @(posedge clk1) begin
-    EX_MEM_IR <= #2 ID_EX_IR;
-    EX_MEM_B <= #2 ID_EX_B;  // for store instruction
+//-----------------------------------------------------------------EX Stage-------------------------------------------------------------------------
+always @(posedge clk) begin
+    if (reset) begin
+        EX_MEM_IR <= 0;
+        EX_MEM_ALUOut <= 0;
+        EX_MEM_B <= 0;
+        EX_MEM_cond <= 0;
+        EX_MEM_type <= 3'b000;
+    end
+    else begin
+    EX_MEM_IR <= ID_EX_IR;
+    EX_MEM_B <= ID_EX_B;  // for store instruction
     if (!HALTED) begin
         case (ID_EX_type)
         RR_ALU: begin
-            case (ID_EX_IR[31:26])  // opcode
-                ADD: EX_MEM_ALUOut <= #2 ID_EX_A + ID_EX_B;
-                SUB: EX_MEM_ALUOut <= #2 ID_EX_A - ID_EX_B;
-                AND: EX_MEM_ALUOut <= #2 ID_EX_A & ID_EX_B;
-                OR: EX_MEM_ALUOut <= #2 ID_EX_A | ID_EX_B;
-                SLT: EX_MEM_ALUOut <= #2 (ID_EX_A < ID_EX_B) ? 1 : 0;
-                MUL: EX_MEM_ALUOut <= #2 ID_EX_A * ID_EX_B;
+            case ({ID_EX_funct7, ID_EX_funct3})  // opcode
+                {F7_ADD,F3_ADD_SUB}: EX_MEM_ALUOut <= ID_EX_A + ID_EX_B;  //ADD
+                {F7_SUB,F3_ADD_SUB}: EX_MEM_ALUOut <= ID_EX_A - ID_EX_B;  //SUB
+                {F7_AND,F3_AND}: EX_MEM_ALUOut <= ID_EX_A & ID_EX_B; //AND
+                {F7_OR,F3_OR}: EX_MEM_ALUOut <= ID_EX_A | ID_EX_B;  //OR
+                {F7_SLT,F3_SLT}: EX_MEM_ALUOut <= ($signed(ID_EX_A) < $signed(ID_EX_B)) ? 1 : 0;  //SLT
+                {F7_MUL,F3_MUL}: EX_MEM_ALUOut <= ID_EX_A * ID_EX_B; //MUL
+                default: EX_MEM_ALUOut <= 32'b0; 
             endcase
-            EX_MEM_type <= #2 RR_ALU;
+            EX_MEM_type <= RR_ALU;
         end
         RM_ALU: begin
-            case (ID_EX_IR[31:26])  // opcode
-                ADDI: EX_MEM_ALUOut <= #2 ID_EX_A + ID_EX_Imm;
-                SUBI: EX_MEM_ALUOut <= #2 ID_EX_A - ID_EX_Imm;
-                SLTI: EX_MEM_ALUOut <= #2 (ID_EX_A < ID_EX_Imm) ? 1 : 0;
+            case (ID_EX_funct3)
+                F3_ADD_SUB: EX_MEM_ALUOut <= ID_EX_A + ID_EX_Imm; // ADDI
+                F3_SLT : EX_MEM_ALUOut <= ($signed(ID_EX_A) < $signed(ID_EX_Imm)) ? 1 : 0; // SLTI
+                F3_AND: EX_MEM_ALUOut <= ID_EX_A & ID_EX_Imm; // ANDI
+                F3_OR: EX_MEM_ALUOut <= ID_EX_A | ID_EX_Imm;  // ORI
+                default: EX_MEM_ALUOut <= 32'b0;
             endcase
-            EX_MEM_type <= #2 RM_ALU;
+            EX_MEM_type <= RM_ALU;
         end
         LOAD, STORE: begin
-            EX_MEM_ALUOut <= #2 ID_EX_A + ID_EX_Imm;  // calculate memory address
-            EX_MEM_B <= #2 ID_EX_B;  // store rt value for SW
+            EX_MEM_ALUOut <= ID_EX_A + ID_EX_Imm;  // calculate memory address
+            EX_MEM_B <= ID_EX_B;  // for store instruction
             if (ID_EX_type == LOAD)
-                EX_MEM_type <= #2 LOAD;
+                EX_MEM_type <= LOAD;
             else
-                EX_MEM_type <= #2 STORE;
+                EX_MEM_type <= STORE;
         end
         BRANCH: begin
-            if ((ID_EX_IR[31:26] == BNEQZ && ID_EX_A != 0) || (ID_EX_IR[31:26] == BEQZ && ID_EX_A == 0)) begin
-                EX_MEM_cond <= #2 1;  // branch taken
-                EX_MEM_ALUOut <= #2 ID_EX_NPC + (ID_EX_Imm << 2);  // calculate branch target
-            end else begin
-                EX_MEM_cond <= #2 0;  // branch not taken
+            case (ID_EX_funct3)
+            F3_BEQ: EX_MEM_cond <= (ID_EX_A == ID_EX_B) ? 1:0;
+            F3_BNE: EX_MEM_cond <= (ID_EX_A != ID_EX_B) ? 1:0;
+            default: EX_MEM_cond <= 0;
+            endcase
+            // B-type: target = PC + imm 
+            EX_MEM_ALUOut <= ID_EX_NPC - 4 + ID_EX_Imm;
+            EX_MEM_type   <= BRANCH;
             end
-            EX_MEM_type <= #2 BRANCH;
-        end
-        HALT: HALTED <= #2 1;
-        default: EX_MEM_type <= #2 HALT;
-    endcase
-    end
-end
-//MEM Stage
-always @(posedge clk2) begin
-    MEM_WB_IR <= #2 EX_MEM_IR;
-    if (!HALTED) begin
-        case (EX_MEM_type)
-            RR_ALU, RM_ALU: begin
-                MEM_WB_ALUOut <= #2 EX_MEM_ALUOut;
-                MEM_WB_type <= #2 EX_MEM_type;
-            end
-            LOAD: begin
-                MEM_WB_LMD <= #2 mem[EX_MEM_ALUOut];  // read from memory
-                MEM_WB_type <= #2 LOAD;
-            end
-            STORE: begin
-                if (!TAKEN_BRANCH) mem[EX_MEM_ALUOut] <= #2 EX_MEM_B;  // write to memory only if not a taken branch
-                MEM_WB_type <= #2 STORE;
-            end
-            BRANCH: ;  // no memory operation for branch
-            HALT: HALTED <= #2 1;
+        HALT: HALTED <= 1;
+        default: EX_MEM_type <= HALT;
         endcase
     end
 end
-//WB Stage
-always @(posedge clk1) begin
-        if (!TAKEN_BRANCH) begin     // only write back if not a taken branch
+end
+//-----------------------------------------------------------------MEM Stage-------------------------------------------------------------------------
+always @(posedge clk) begin
+    if (reset) begin
+        MEM_WB_IR <= 0;
+        MEM_WB_ALUOut <= 0;
+        MEM_WB_LMD <= 0;
+        MEM_WB_type <= 3'b000;
+    end else begin
+    MEM_WB_IR <= EX_MEM_IR;
+    if (!HALTED) begin
+        case (EX_MEM_type)
+            RR_ALU, RM_ALU: begin
+                MEM_WB_ALUOut <= EX_MEM_ALUOut;
+                MEM_WB_type <= EX_MEM_type;
+            end
+            LOAD: begin
+                MEM_WB_LMD <= dmem_read_data;  // read from memory
+                MEM_WB_type <= LOAD;
+                
+            end
+            STORE: begin
+                MEM_WB_type <= STORE;
+            end
+            BRANCH: ;  // no memory operation for branch
+            HALT: HALTED <= 1;
+            default: MEM_WB_type <= HALT;
+        endcase
+    end
+    end
+end
+//-----------------------------------------------------------------WB Stage-------------------------------------------------------------------------
+always @(posedge clk) begin
+    if (reset) begin
+    end else if (!TAKEN_BRANCH) begin     // only write back if not a taken branch
         case (MEM_WB_type)
-            RR_ALU: register_bank[MEM_WB_IR[15:11]] <= #2 MEM_WB_ALUOut;  // write back to rd
-            RM_ALU: register_bank[MEM_WB_IR[20:16]] <= #2 MEM_WB_ALUOut;  // write back to rt
-            LOAD: register_bank[MEM_WB_IR[20:16]] <= #2 MEM_WB_LMD;  // write back to rt
+            RR_ALU,RM_ALU: if (MEM_WB_IR[11:7] != 5'b0)  // never write x0 register
+            register_bank[MEM_WB_IR[11:7]] <= MEM_WB_ALUOut;
+            
+            LOAD: if (MEM_WB_IR[11:7] != 5'b0)
+            register_bank[MEM_WB_IR[11:7]] <= MEM_WB_LMD;
+            
             BRANCH, STORE, HALT: ;  // no write back for branch, store, or halt
         endcase
         end
