@@ -291,11 +291,3 @@ Each register holds four packed 8-bit unsigned integers. The instruction compute
 **Expected speedup:** For a 128-element dot product, instruction count drops from ~384 (3 instructions/element: `ANDI`, `MUL`, `ADD`) to ~32 (`DOTPROD` per group of 4 elements) — a **12× reduction** in instruction count.
 
 ---
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
----
-
-*Designed and implemented in Verilog as part of a computer architecture study. Contributions and issue reports are welcome.*
